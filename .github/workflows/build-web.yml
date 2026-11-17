@@ -1,0 +1,85 @@
+name: Build AniCraft Web Bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-web.yml"
+      - "crates/**"
+      - "src/**"
+      - "assets/**"
+      - "scripts/**"
+      - "packaging/web/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anicraft-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-web:
+    name: Build Wasm Bundle & Notify Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust & Workspace Crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          cache-workspace-crates: true
+          cache-on-failure: true
+
+      - name: Install matching wasm-bindgen CLI (prebuilt)
+        run: |
+          WANT="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          echo "Installing wasm-bindgen-cli v${WANT}..."
+          if curl -fsSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WANT}/wasm-bindgen-${WANT}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xzf - --strip-components=1 -C "$HOME/.cargo/bin" "wasm-bindgen-${WANT}-x86_64-unknown-linux-musl/wasm-bindgen"; then
+            wasm-bindgen --version
+          else
+            cargo install wasm-bindgen-cli --version "$WANT" --locked
+          fi
+
+      - name: Build & Package AniCraft Web (6 MiB parallel chunks)
+        run: |
+          bash packaging/web/package.sh
+          mkdir -p dist/ani
+          cp -R dist/anicraft-web-*/* dist/ani/
+          ls -lh dist/ani
+
+      - name: Upload AniCraft Web Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: the-allcraft-ani-web
+          path: dist/ani
+          retention-days: 90
+
+      - name: Trigger AllCraft Studio Hub Deploy
+        if: success()
+        env:
+          STUDIO_PAT: ${{ secrets.STUDIO_PAT }}
+        run: |
+          if [ -z "$STUDIO_PAT" ]; then
+            echo "::warning::STUDIO_PAT secret not set in anicraft; skipping Hub auto-trigger."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $STUDIO_PAT" \
+            https://api.github.com/repos/thepixopik/allcraft/dispatches \
+            -d '{"event_type":"app-updated","client_payload":{"repo":"thepixopik/anicraft"}}'
